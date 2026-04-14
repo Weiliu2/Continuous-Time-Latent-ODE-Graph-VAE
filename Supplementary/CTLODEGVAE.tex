@@ -1,0 +1,497 @@
+\section{Continuous-Time Latent ODE Graph VAE}
+
+Suppose we observe a sequence of graphs at irregular times from a single dynamic system, 
+for example the traffic flow of a city's transportation system, 
+where each edge in the adjacency matrix is the traffic flow from one hub to the other, 
+and the node feature shows the population and other physical conditions. 
+The sequence can also represent an individual trajectory,
+like the brain connectivities scanned during a compact time period, 
+and cell-cell communication recorded from some blood samples collected from a single subject within days. 
+In a word, the sequence we consider in this case study must be a series of trajectories showing 
+subject-wise evolution within a consecutive period to make sure causally consistent adjacency transitions 
+with temporal differentiability\footnote{Differentiability is rough here but learnable by algorithm. We say very small time gap between two proximal data points will contribute to temporal differentiability.}. 
+Exclusion without the features we require includes brain connectivities recorded from a group with different ages. 
+This kind of data is extremely noised by violating the single subject requirement, 
+and is not temporally continuous since the gap between different ages is very large.
+
+To facilitate the mathematical illustration of our model, we denote the time series by
+\begin{equation*}
+    \mathcal{D}=\{(t_1,X_{t_1},A_{t_1}),\ldots,(t_T,X_{t_T},A_{t_T})\},
+\end{equation*}
+where $A_t\in\mathbb{R}^{N\times N}$ is a weighted adjacency matrix and
+$X_t\in\mathbb{R}^{N\times d}$ is a node feature matrix.
+The goal is to learn a continuous-time latent dynamical system capable of
+encoding graph evolution and predicting future adjacency matrices.
+
+With this purpose, we propose the Continuous-Time Latent ODE Graph VAE, 
+which is constructed under the variational autoencoder framework. 
+The model is featured by a latent state denoted by $z$. 
+It is a $N\times d_z$ real matrix whose rows $z_1,\cdots,z_N$ are embeddings of nodes and corresponding features. 
+The learning procedure is given in the next subsection. 
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    >=LaTeX,
+    node distance=12mm,
+    box/.style={
+        draw, rounded corners, thick,
+        align=center, inner sep=5pt
+    },
+    arrow/.style={->, thick}
+]
+
+% Nodes
+% \node[box] (z0) {$p(z_{t_0})$};
+% \node[box] (z1|z0) {$p(z_{t_1}|z_{t_0})$};
+% \node[box] (transition) {$\cdots$};
+% \node[box] (zk+1|zk) {$p(z_{t_{k+1}}|z_{t_k})$};
+
+\node[box] (ode) {Latent Neural ODE\\
+$\displaystyle \frac{dz}{dt}=f_\theta(z,t)$\\
+Solve on $[t_{k-1},t_k]$ to get $z^-_{t_k}$};
+
+\node[box, below=10mm of ode] (prior) {Gaussian Prior\\
+$z^-_{t_k}\rightarrow (\sigma^2_{p,t_k,i})$};
+
+\node[box, right=10mm of ode] (post) {Variational Posterior\\
+$[z^-_{t_k}||H^{(2)}_{t_k}(i)]\rightarrow (\mu_{t_k},\sigma^2_{t_k})$\\
+Reparameterization\\
+$z_{t_k}=\mu_{t_k}+\sigma_{t_k}\odot\epsilon$};
+
+\node[box, right=10mm of post] (gcn) {GCN Encoder\\$\{(X_{t_k},A_{t_k})\}\rightarrow H^{(2)}_{t_k}$};
+
+\node[box, below=9mm of post] (decoder) {Shared Edge Decoder\\
+$[z_{i,t_k}||z_{j,t_k}]\rightarrow A_{t_k}(i,j)$};
+
+% Arrows
+\draw[arrow] (gcn) -- node[above] {$H^{(2)}_{t_k}$} (post);
+
+\draw[arrow] (ode) -- node[left] {$z^-_{t_k}$} (prior);
+\draw[arrow] (ode) -- node[above] {$z^-_{t_k}$} (post);
+
+\draw[arrow] (post) -- node[left] {$z_{t_k}$} (decoder);
+
+\end{tikzpicture}
+\caption{Architecture of the Continuous-Time Latent ODE Graph VAE. 
+A GCN encodes graph snapshots, the latent state evolves via a Neural ODE, 
+prior and posterior MLPs define Gaussian distributions on node embeddings, 
+and a shared edge decoder reconstructs adjacency matrices.}
+\end{figure}
+
+% We improve the original architecture by (i) using node-wise latent states,
+% (ii) constraining the latent ODE to be Lipschitz-continuous,
+% (iii) sharing decoder parameters across all edges,
+% and (iv) employing KL annealing and ODE regularization to ensure stable training.
+% All changes preserve the modeling objective while increasing numerical and statistical stability.
+
+\subsection{Method}
+
+We briefly introduce the learning steps before mathematical illustration. 
+The forward propagation starts first by applying a GCN encoder to the original graph data to embed the weighted adjacency matrix and its node features into a low dimensional graph representation. 
+Then it uses neural ODE to update the latent state by solving a initial valued problem. 
+The network function to be integrated consists of a 2-layer MLP using the latent state and time as input variables. 
+The output of the neural ODE is the prior mean of the latent state at the next time stamp.  
+The prior distribution of latent state at the next time stamp is learnt by a 2-layer MLP using this prior mean and time gap between the current and the next. 
+The variational posterior is learnt by another 2-layer MLP using the prior mean and low dimensional graph representation. 
+Both the prior and variational posterior are assumed to be joint products of independent Gaussian distributions of $z_i$. 
+The joint edge decoder for edge weights can be factorized into a joint product of edge decoders for each edge weight. 
+It is also Gaussian and learnt by using latent state pairs $(z_i,z_j)$ sampled from variational posterior. 
+The backward propagation uses the accumulated gradients of model parameters to maximize the ELBO 
+with adam optimizer.
+
+To make the model training stable,  
+we constrain the operator norm of the linear coefficients in the MLPs to make the latent ODE Lipschitz-continuous 
+and hence avoid the neural ODE falling into a stiff situation. 
+Moreover, if the KL term is too strong early in training, the encoder may learn to output a posterior that matches the prior regardless of the input.
+This makes the latent variables uninformative. Hence, we employ KL annealing to alleviate posterior collapse. 
+
+\paragraph{GCN Encoder}
+
+At each time $t$, we encode the graph $G_t=(X_t,A_t)$ using a two-layer GCN:
+\begin{align*}
+    H^{(1)}_t &= \mathrm{ReLU}(\tilde{D}_t^{-\frac12}\tilde{A}_t\tilde{D}_t^{-\frac12}X_t W^G_1), \\
+    H^{(2)}_t &= \tilde{D}_t^{-\frac12}\tilde{A}_t\tilde{D}_t^{-\frac12}H^{(1)}_t W^G_2,
+\end{align*}
+where $\tilde{A}_t=A_t+I$, and $\tilde{D}_t$ is degree matrix of $\tilde{A}_t$. 
+$W^G_1$ and $W^G_2$ are model parameters to be learnt. 
+The output $H^{(2)}_t\in \mathbb{R}^{N\times d_h}$ contains node-wise embeddings.
+
+\paragraph{Node-wise Latent Neural ODE}
+
+Each node $i$ has a time-continuous latent trajectory $z_i(t)\in\mathbb{R}^{d_z}$.
+We define the ODE
+\begin{equation*}
+    \frac{dz(t)}{dt} = f_\theta(z(t),t),
+\end{equation*}
+with $z(t)=\begin{bmatrix}
+    z_1(t) \\
+    \vdots \\
+    z_N(t)\end{bmatrix} \in \mathbb{R}^{N\times d_z}$.
+To ensure stability, the vector field uses:
+(i) Lipschitz-constrained linear layers (spectral normalization),
+(ii) smooth activations (SoftPlus), and
+(iii) learnable scaling coefficient. 
+All these contribute to a MLP network function 
+\begin{equation}
+    \label{eq: sec4_ODEfunction}
+    f_\theta(z_i(t),t) =s \cdot W^O_1\mathrm{SoftPlus}\left([z_i(t)||t]W^O_0+b^O_0\right)+b^O_1,
+\end{equation}
+where $s$ is a learnable scaling term, and the norm of $W^O_1$ and $W^O_2$ are controlled via spectral normalization. 
+This MLP maps from $\mathbb{R}^{N\times(d_z+1)}$ to $\mathbb{R}^{N\times d_z}$. 
+Of note, although the three measures maintain the stability, 
+they also force (\ref{eq: sec4_ODEfunction}) to have a slowly varying trajectory by restricted to low-curvature and Lipschitz continuous flows. 
+This result in the liability in learning the nonlinear and discontinuous dynamic. 
+
+As proposed by Chen et al. \cite{chen2019neuralordinarydifferentialequations}, 
+we use a black box ODE solver to get the value of latent state at the end of an interval. 
+Given a interval $[t_{k-1},t_k]$, it solves $z(t_k)$ from an initial value problem 
+\begin{equation*}
+    \left\{\begin{aligned}
+        &\frac{dz(t)}{dt} = f_{\theta}(z(t),t), \\
+        &z(t_{k-1}) = z_{t_{k-1}}.
+    \end{aligned}\right.
+\end{equation*}
+We denote solution $z(t_k)$ by $z_{t_k}^-$, which is the prior mean. 
+
+We set the initial value of the ODE system on first time interval by a linear layer using input as the GCN layer processed embedding $H^{(2)}_{t_0}$:
+\begin{equation*}
+    z_{t_0} = H^{(2)}_{t_0}W + b, 
+\end{equation*}
+where $W$ and $b$ are randomly initialized. 
+
+It's worth mentioning that the network function (\ref{eq: sec4_ODEfunction}) is Markovian with first-order temporal dependence, 
+since the latent variable is updated only by the current time and nearest previous latent state. 
+This greatly decrease the ability to leverage the past time information and subsequently lead to a short-term temporal memory system. 
+In this way, the algorithm only excels at learning near-equilibrium or slowly drifting dynamics. 
+Furthermore, the latent state is developed only on the GCN aggregated information at the beginning of the time series. 
+The information from nodes and edges on the intermediate time stamps are not included. 
+This implies the algorithm can only performs well on the situations where node-edge interactions are mostly static or weak, 
+i.e. the information flows in an approach invariant to both time and topology of the network.
+% Integration between times $t_{k-1}$ and $t_k$ yields the ODE prior mean:
+% \begin{equation*}
+%     z_{t_k}^- = \mathrm{ODESolve}(z_{t_{k-1}}, f_\theta, t_{k-1},t_k).
+% \end{equation*}
+% We further regularize the ODE via:
+% \begin{equation*}
+%     \mathcal{R}_{\mathrm{ODE}} = \lambda_{\mathrm{ODE}}\int_{t_{k-1}}^{t_k}\|f_\theta(z(t),t)\|^2 dt.
+% \end{equation*}
+
+\paragraph{Gaussian Prior}
+
+We suppose the latent states $z_1,\cdots,z_N$ for each node are independent. 
+Given the ODE prediction $z_{t_k}^-\in\mathbb{R}^{N\times d_z}$, the prior is centered around it, 
+\begin{equation*}
+    p(z_{t_k}) = \prod_{i=1}^N \mathcal{N}(z_{i,t_k} \mid z_{i,t_k}^-, \mathrm{diag}(\sigma_{p,t_k,i}^2)),
+\end{equation*}
+with variance
+\begin{equation*}
+    \sigma^2_{p,t_k,i}= \mathrm{SoftPlus}\big(W_1^p\, \tanh\!\big( [z_{i,t_k}^-||\log(1+t_k-t_{k-1})]W_0^p  + b_0^p \big) + b_1^p\big).
+\end{equation*}
+This MLP is shared cross all node level latent states and maps from $\mathbb{R}^{d_z+1}$ to $\mathbb{R}^{d_z}$. 
+
+\paragraph{Variational Posterior}
+
+For each time stamp $t_k$, the posterior factorizes over nodes and is a joint distribution of $N$ multivariate normal distributions 
+\begin{equation*}
+    q(z_{t_k})=\prod_{i=1}^N \mathcal{N}(z_{i,t_k} \mid \mu_{i,t_k}, \mathrm{diag}(\sigma_{i,t_k}^2)).
+\end{equation*}
+
+We condition on both the ODE prior state and the GCN embedding:
+\begin{equation*}
+    \left\{\begin{aligned}
+        \mu_{i,t_k} &= W_1^q \tanh\!\big( W_0 [z_{i,t_k}^- \,||\, H^{(2)}_{t_k}(i)] + b_0 \big) + b_1^q,\\
+        \log(\sigma^2_{i,t_k}) &= W_1^s \tanh\!\big( W_0 [z_{i,t_k}^- \,||\, H^{(2)}_{t_k}(i)] + b_0 \big) + b_1^s.
+    \end{aligned}\right.
+\end{equation*}
+The two MLPs are shared cross node level latent states and map from $\mathbb{R}^{d_z+d_h}$ to $\mathbb{R}$ and $\mathbb{R}^{d_z}$ respectively. 
+
+Of note, both the prior and posterior are based on the mean field assumption that the joint distribution can be factorized by separated marginals, 
+which can be seen by the diagonal variances. 
+Subsequently, the algorithm can not catch correlated node dynamics and hence can not represent the global latent. 
+
+\paragraph{Shared Edge Decoder}
+
+we use a Gaussian decoder to get the weighted adjacency matrix $A_{t_k}$ from the latent dynamic $z_{t_k}$ sampled from $q(z_{t_k})$ by reparameterization $z_{t_k}=\mu_{t_k}+\sigma_{t_k}\odot \epsilon$, 
+$\epsilon\sim\mathcal{MN}(0,I_N,I_{d_z})$. 
+Instead of a separate MLP for each edge, we use a single shared decoder:
+\begin{equation*}
+    p(A_{t_k}(i,j)\mid z_{i,t_k}, z_{j,t_k})=\mathcal{N}\!\Big(\mu_{ij,t_k},\; \sigma_d^2\Big),
+\end{equation*}
+where
+\begin{equation*}
+    \left\{\begin{aligned}
+        \mu_{ij,t_k} &= W_1^d\, \mathrm{tanh}\!\big([z_{i,t_k}|| z_{j,t_k}]W_0^d + b_0^d\big)+b_1^d, \\
+        \sigma^2_d &= 1.
+    \end{aligned}\right.
+\end{equation*}
+The MLP maps from $\mathbb{R}^{2d_z}$ to $\mathbb{R}$. 
+
+When the adjacency matrix is binary, we use a Bernoulli decoder, given by 
+\begin{equation*}
+    p(A_{t_k}(i,j)|z_{i,t_k},z_{j,t_k}) = p^{A_{t_k}(i,j)}(1-p)^{1-A_{t_k}(i,j)},
+\end{equation*}
+where 
+\begin{equation*}
+    \left\{\begin{aligned}
+        \mathrm{logit} &= W_1^d\, \mathrm{tanh}\!\big([z_{i,t_k}|| z_{j,t_k}]W_0^d + b_0^d\big)+b_1^d, \\
+        p &= \mathrm{Sigmoid}(\mathrm{logit}).
+    \end{aligned}\right.
+\end{equation*}
+
+It is clear that a shared edge decoder for all edges will enforce the prediction rule to be homogeneous,  
+and make the predicted graph share a similar pattern with the latent space. 
+As a consequence, the algorithm performs bad when the true graph dynamic is beyond its foreseeing but still converges steadily. 
+Moreover, similar to the design of network function (\ref{eq: sec4_ODEfunction}), 
+the decoder is static and memoryless by the lack of the information from past edges and latent state representing edges. 
+Such a decoder will infer the future edges by the latent state of nodes and current time but without considering the edge itself. 
+This implies the decoder favors smooth edge evolution even when incorrect. 
+
+\paragraph{Evidence Lower Bound (ELBO)}
+
+The per-time ELBO is
+\begin{equation*}
+    \mathcal{L}_k = \mathbb{E}_{q}[\log p(A_{t_k} \mid z_{t_k})] - \beta_k D_{\mathrm{KL}}(q(z_{t_k}) \,\|\, p(z_{t_k})),
+\end{equation*}
+where $\beta_k$ is a KL annealing coefficient increasing from $0$ to $1$.
+
+The KL divergence has a closed-form expression, which is given by
+\begin{align*}
+    D_{\mathrm{KL}}(q||p) &= \mathbb{E}_{q}\left[\log\frac{\prod_{i=1}^{d_z}\mathcal{N}(\mu_{i,t_k},\mathrm{diag}(\sigma^2_{i,t_k}))}{\prod_{i=1}^{d_z}\mathcal{N}(z^-_{i,t_k},\mathrm{diag}(\sigma^2_{i,p,t_k}))}\right] \\
+                          &= \frac{1}{2}\sum_{i=1}^{N}\left\{\log\prod_{j=1}^{d_z}\frac{\sigma^2_{j,i,p,t_k}}{\sigma^2_{j,i,t_k}} -\mathbb{E}_{q}\left[\sum_{j=1}^{d_z}\frac{(z_{j,i,t_k}-\mu_{j,i,t_k})^2}{\sigma^2_{j,i,t_k}}\right] + \mathbb{E}_{q}\left[\sum_{j=1}^{d_z}\frac{(z_{j,i,t_k}-z^-_{j,i,t_k})^2}{\sigma^2_{j,i,t_k}}\right]\right\} \\
+                          &= \frac{1}{2}\sum_{i=1}^{N}\left\{\log\prod_{j=1}^{d_z}\frac{\sigma^2_{j,i,p,t_k}}{\sigma^2_{j,i,t_k}} -d_z + \sum_{j=1}^{d_z}\left[\frac{\sigma^2_{j,i,t_k}}{\sigma^2_{j,i,p,t_k}}+\frac{(\mu_{j,i,t_k}-z^-_{j,i,t_k})^2}{\sigma^2_{j,i,p,t_k}}\right]\right\}, 
+\end{align*}
+where we use the fact that $z_{j,i,t_k}\sim\mathcal{N}(\mu_{j,i,t_k},\sigma^2_{j,i,t_k})$ and $\frac{z_{j,i,t_k}-z^-_{j,i,t_k}}{\sigma_{j,i,p,t_k}}\sim\mathcal{N}(\frac{\mu_{j,i,t_k}-z_{j,i,t_k}}{\sigma_{j,i,p,t_k}},\frac{\sigma^2_{j,i,t_k}}{\sigma^2_{j,i,p,t_k}})$. 
+
+To estimate $\mathbb{E}_{q}[\log p(A_{t_k}|z_{t_k})]$, we use Monte Carlo method 
+\begin{equation*}
+    \mathbb{E}_{q}[\log p(A_{t_k}|z_{t_k})] \approx \frac{1}{n}\sum_{i=1}^{n}\log p(A_{t_k}|z^{(i)}_{t_k}). 
+\end{equation*}
+
+The total loss for all time stamps is
+\begin{equation*}
+    \mathcal{L}=\sum_{k=1}^T \mathcal{L}_k.
+\end{equation*}
+% \begin{equation*}
+%     \mathcal{L}=\sum_{k=1}^T \mathcal{L}_k - \mathcal{R}_{\mathrm{ODE}}.
+% \end{equation*}
+
+\paragraph{Prediction}
+
+For a future time $t_{T+1}$:
+\begin{equation*}
+    z_{t_{T+1}}^- = \mathrm{ODESolve}(z_{t_T}, f_\theta, t_T, t_{T+1}). 
+\end{equation*}
+Then we use learnt GCN encoder to embed the feature matrix and get a embedding $H^{(2)}_{t_{T+1}}=\mathrm{GCNencoder}(X_{t_{T+1}}, I)$. 
+Using $H^{(2)}_{t_{T+1}}$, we construct variational posterior $q(z_{t_{T+1}})=\prod_{i=1}^{N}\mathcal{N}(\mu_{i,t_{T+1}},\sigma^2_{i,t_{T+1}})$. 
+Predictions follow from
+\begin{equation*}
+    \mu_{ij,t_{T+1}} = \mathrm{Decoder}(\mu_{i,t_{T+1}}, \mu_{j,t_{T+1}}).
+\end{equation*}
+We output either sampled adjacency matrices or their means. 
+When the edge is binary, we output the prediction with a mask matrix by assigning 1 to logits bigger than $0.5$ and 0 to the rest.
+
+\begin{table}[htbp]
+    \centering
+    \caption{Continuous-Time Latent ODE Graph VAE (training parameter)}
+    \label{tab: sec4_training}
+    \begin{tabular}{l}
+        \hline \\
+        \textbf{Algorithm: Continuous-Time Latent ODE Graph VAE} \\
+        \hline \\
+        \textbf{For iter=1:max} \\
+        \quad\textbf{For k=0:K} \\
+        \qquad 1. $G_{t_k}=(X_{t_k},A_{t_k})$, $H^{(2)}_{t_k}=\mathrm{GCNencoder}(X_{t_k},A_{t_k})$ \\
+        \qquad 2. $z_{t_k}^-=$SolveODE$(z_{t_{k-1}},f(z(t),t),t_{k-1},t_k)$ \\
+        \qquad 3. Posterior $z_{t_k}\sim q(z_{t_k})=\prod_{i=1}^{N}\mathcal{N}(z_{i,t_k}\mid\mu_{i,t_k},\mathrm{diag}(\sigma^2_{i,t_k}))$, $[\mu_{i,t_k},\sigma^2_{i,t_k}]=$MLP$(z_{i,t_k}^-,H^{(2)}_{t_k}(i))$ \\
+        \qquad 4. Decoder $p(A_{t_k}|z_{t_k})=\prod_{i,j}\mathcal{N}(A_{t_k}(i,j)|\mu_{ij,t_k},\sigma^2_{d})$ \\
+        \qquad 5. Compute gradients $\nabla\tilde{\mathcal{L}}_k$ \\
+        \quad 6. Update parameter using a gradient ascent method with total gradient $\sum_{k=0}^{K}\nabla\tilde{\mathcal{L}}_k$ \\
+        \hline
+    \end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+    \centering
+    \caption{Continuous-Time Latent ODE Graph VAE (prediction)}
+    \label{tab: sec4_prediction}
+    \begin{tabular}{l}
+        \hline \\
+        \textbf{Algorithm: Continuous-Time Latent ODE Graph VAE} \\
+        \hline \\
+        \textbf{Given future time stamp $t_{K+1}$:} \\
+        \quad 1. $H^{(2)}_{t_{K+1}}=\mathrm{GCNencoder}(X_{t_{K+1}},I)$ \\
+        \quad 2. $z_{t_{K+1}}^-=\text{SolveODE}(z_{t_K},f(z(t),t),t_K,t_{K+1})$ \\
+        \quad 3. Posterior $q(z_{t_{K+1}})=\prod_{i=1}^{N}\mathcal{N}(z_{i,t_{K+1}}\mid \mu_{i,t_{K+1}},\mathrm{diag}(\sigma^2_{i,t_{K+1}}))$, $[z_{i,t_{K+1}}, \sigma^2_{i,t_{K+1}}]=\mathrm{MLP}(z_{i,t_{K+1}}^-,H^{(2)}_{t_{K+1}}(i))$ \\
+        \quad 4. Decoder $p(A_{t_{K+1}}|\mu_{t_{K+1}})=\prod_{i,j}\mathcal{N}(A_{t_{K+1}}(i,j)\mid\mu_{ij,t_{K+1}},\sigma^2_d)$ \\
+        \quad 5. Prediction $A_{t_{K+1}}$ is either \\
+        \qquad i) Sampled from the Decoder or \\
+        \qquad ii) Chosen as the mean \\
+        \textbf{Return $A_{t_{K+1}}$} \\
+        \hline 
+    \end{tabular}
+\end{table}
+
+\subsection{Experiment}
+
+Since network function is continuous, we have that the latent space is continuous w.r.t time.
+When strong norm restriction is enforced on the network parameters, 
+the latent space tends to be over smooth which extremely narrows down the expression of the neural network. 
+Furthermore, that the decoder strongly relies on the latent state means the final prediction also lies in a over smoothed space. 
+With all these knowledge, we can conjecture that the algorithm fails to learn complicated hidden dynamic when the network function is over smoothed.
+In this part, we design two experiments to verify it. 
+
+\subsubsection{Learning from smoothness}
+The first experiment aims at testing what the algorithm learns from the dataset. 
+It has a smooth data generation scheme given by 
+\begin{equation}
+    \label{eq: sec3_generator1}
+    \left\{\begin{aligned}
+        \epsilon^X\in(0,1)^{N\times D}:& \epsilon^X_{ij}\sim\mathcal{N}(0,1), \\
+        \epsilon^P\in(0,1)^{N\times N}:& \epsilon^P_{ij}\sim\mathcal{N}(0,1), \\
+        X: & X_{ij} = 0.2 + \sqrt{\epsilon_{ij}}, \\
+        P: & P_{ij} = \frac{1}{1+\exp\{-0.1(\epsilon^P_{ij}+\epsilon^P_{ji})\}}, \\
+        A: & A_{ij} = 1, P_{ij}\geq0.5; 0, P_{ij}<0.5.
+    \end{aligned}\right.
+\end{equation}
+The adjacency matrix consists of random variables centering around $\frac{1}{1+\mathrm{exp}(0)}= 0.5$. 
+Hence we choose the edge $A_{ij}$ to be connected if its corresponding logit value $P_{ij}$ is bigger than the mean and vice versa. 
+
+\paragraph{Gaussian decoder}
+The algorithm is equipped with a Gaussian decoder. 
+We generate a time series $(t_k, X_k, P_k)_{1\leq k\leq 20}$ with generator \ref{eq: sec3_generator1}, 
+where we set node number, feature number and total time stamps by 5, 10 and 20.
+The algorithm is trained on the first 19 pieces of the time series for 1000 iterations. 
+Then it predicts the edge probabilities $P$ of the last graph using the second to the last graph. 
+\begin{align}
+    \label{eq: sec3_results11}
+    &P_{pred}=\begin{bmatrix}
+        0.5103& 0.5103& 0.5103& 0.5103& 0.5103 \\
+        0.5103& 0.5103& 0.5103& 0.5103& 0.5103 \\
+        0.5103& 0.5103& 0.5103& 0.5103& 0.5103 \\
+        0.5103& 0.5103& 0.5103& 0.5103& 0.5103 \\
+        0.5103& 0.5103& 0.5103& 0.5103& 0.5103
+    \end{bmatrix},
+    P_{true}=\begin{bmatrix}
+        0.5& 0.5& 0.5& 0.5& 0.5 \\
+        0.5& 0.5& 0.5& 0.5& 0.5 \\
+        0.5& 0.5& 0.5& 0.5& 0.5 \\
+        0.5& 0.5& 0.5& 0.5& 0.5 \\
+        0.5& 0.5& 0.5& 0.5& 0.5        
+    \end{bmatrix}.
+\end{align} 
+The result is shown in (\ref{eq: sec3_results11}).
+We can see that the predicted probability matrix has entries consistently close to 0.5, 
+although with a slight bias.
+Hence, the algorithm tries to learn the mean value of the distribution that $P$ follows, 
+which is the true dynamic behind the noised samples.
+
+\paragraph{Bernoulli decoder}
+The algorithm is equipped with a Bernoulli decoder.
+We generate two time series $(t^1_k, X^1_k, A^1_k)_{1\leq k\leq 20}$ and $(t^2_k, X^2_k, A^2_k)$. 
+For the first time series, we set node number, feature number and total time stamps by 5, 1 and 20. 
+For the second one, we set them by 5, 10 and 20. 
+As the same for the two time series, the algorithm is trained on the first 19 pieces of the time series for 1000 iterations. 
+Then it predicts the edge connections $A$ of the last graph using the second to the last graph, 
+and prints the predicted probability matrix as well. 
+\begin{align}
+    \label{eq: sec3_results12}
+    &P^1_{pred}=\begin{bmatrix}
+        0.4606& 0.4992& 0.4658& 0.5057& 0.4688 \\
+        0.4992& 0.5335& 0.5038& 0.5397& 0.5065 \\
+        0.4658& 0.5038& 0.4710& 0.5103& 0.4741 \\
+        0.5057& 0.5397& 0.5103& 0.5457& 0.5132 \\
+        0.4688& 0.5065& 0.4741& 0.5132& 0.4771
+    \end{bmatrix},
+    P^2_{pred}=\begin{bmatrix}
+        0.2690& 0.2740& 0.6473& 0.2795& 0.2771 \\
+        0.2740& 0.2756& 0.6474& 0.2809& 0.2787 \\
+        0.6473& 0.6474& 0.4332& 0.6458& 0.6462 \\
+        0.2795& 0.2809& 0.6458& 0.2838& 0.2827 \\
+        0.2771& 0.2787& 0.6462& 0.2827& 0.2805
+    \end{bmatrix}. \\
+    &P_{true}=\begin{bmatrix}
+        0.5& 0.5& 0.5& 0.5& 0.5 \\
+        0.5& 0.5& 0.5& 0.5& 0.5 \\
+        0.5& 0.5& 0.5& 0.5& 0.5 \\
+        0.5& 0.5& 0.5& 0.5& 0.5 \\
+        0.5& 0.5& 0.5& 0.5& 0.5
+    \end{bmatrix}.
+\end{align}  
+The results are shown in (\ref{eq: sec3_results12}). 
+Comparing $P^1_{pred}$ and $P^2_{pred}$, we can see that as feature number increases, 
+the noise that the feature brings will inflict heavier impacts on the edge information,
+and potentially overwhelm it when the sizes are extremely unequal. 
+This matches the behavior of GCN encoder. 
+
+Moreover, if we compare the predicted probability matrix in (\ref{eq: sec3_results11}) and $P^2_{pred}$, 
+we can see that the algorithm struggles to recover the true dynamic from the discretized observations but fails.
+This implies the discrete step of assigning edge connection is hard to be reversed by the algorithm. 
+The behavior might help prove that the algorithm with norm restriction is hard to dispose non-smooth time series. 
+We will develop another trail to consolidate this statement. 
+
+\subsubsection{Restricted expression ability}
+For a neural network restricted to smooth space, 
+we assume discrete trends are too "complicated" to learn by the algorithm.
+The second experiment bases on a complicatedly designed mixed generator with both a continuous part and a discrete part. 
+We only display the decoder 
+\begin{equation*}
+    \left\{\begin{aligned}
+        c &: c\in\mathbb{Z}^+\bigcap(0,C) (\text{Randomized at each time stamp}), \\
+        M &: M_{ij}=1,\ c_i=c_j,\ 0, c_i\neq c_j, \\
+        l &: \lambda M_{ij}, \\
+        k &: k_{ij} = \frac{1}{8}(l_{ij}+l_{ji})+4\mathcal{N}(0,1), \\
+        A &: A_{ij} = \mathrm{Sigmoid}(k_{ij}).
+    \end{aligned}\right.
+\end{equation*}
+If we set $\lambda=0$ to ignore the discrete term $M$ (Community representation in the code),
+the adjacency matrix consists of random variables centering around $\frac{1}{8}(l_{ij}+l_{ji})$, 
+which is smaller than 0.5 since $l$ is negative. 
+We first generate a continuous-discrete dynamic mixed time series with 20 time stamps and 1000 iterations, 
+with 4 nodes and 10 features for each. 
+The algorithm uses Gaussian decoder. The training method and prediction are the same as the previous trail. 
+As shown in (\ref{eq: sec3_result21}), we find that the prediction is unsatisfactory. 
+\begin{equation}
+    \label{eq: sec3_result21}
+    A^M_{mean}=\frac{1}{20}\sum_{k=1}^{20}A^M_{t_k}=\begin{bmatrix}
+        0.9994& 0.9972& 0.7906& 0.0122 \\
+        0.9972& 0.8447& 0.5514& 0.9839 \\
+        0.7906& 0.5514& 0.9983& 0.9965 \\
+        0.0122& 0.9839& 0.9965& 0.9946
+    \end{bmatrix}, 
+    A^M_{pred}=\begin{bmatrix}
+        0.7837& 0.7836& 0.7702& 0.7732 \\
+        0.7836& 0.7840& 0.7710& 0.7738 \\
+        0.7702& 0.7710& 0.7845& 0.7824 \\
+        0.7732& 0.7738& 0.7824& 0.7847
+    \end{bmatrix}.
+\end{equation}
+
+However, when the discrete term $M$ is removed, 
+the algorithm gives a better prediction given in (\ref{eq: sec3_result22}). 
+\begin{equation}
+    \label{eq: sec3_result22}
+    A_{mean}=\frac{1}{20}\sum_{k=1}^{20}A_{t_k}=\begin{bmatrix}
+        0.4222& 0.6474& 0.4784& 0.4391 \\
+        0.6474& 0.4985& 0.4361& 0.5528 \\
+        0.4784& 0.4361& 0.5464& 0.5548 \\
+        0.4391& 0.5528& 0.5548& 0.5021
+    \end{bmatrix}, 
+    A_{pred}=\begin{bmatrix}
+        0.5033& 0.5033& 0.5032& 0.5033 \\
+        0.5033& 0.5034& 0.5033& 0.5033 \\
+        0.5032& 0.5033& 0.5031& 0.5032 \\
+        0.5033& 0.5033& 0.5032& 0.5033
+    \end{bmatrix}.
+\end{equation}
+Although with a bias, this is consistent with the observation that the edges are all close to 0.5. 
+
+In conclusion, this algorithm is good at learning from dynamic with low to moderate complexity,
+like learning from data generated by a continuous distribution. 
+When the true data generation scheme is a mixture of continuous and discrete parts, 
+the model usually fails to recover the continuous part from the chaos. 
+
+As an additional discussion (experiment is not shown here), when the true smooth dynamic is complicated but learnable, 
+the algorithm needs longer time series and larger iterations to train. 
+This shows that this algorithm is data-hunger, 
+consistent with the intrinsic nature of neural ODE based models.

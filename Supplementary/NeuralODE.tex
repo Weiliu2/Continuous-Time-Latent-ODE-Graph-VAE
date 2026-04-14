@@ -1,0 +1,116 @@
+\section{Neural ODE}
+
+The neural ODE \cite{chen2019neuralordinarydifferentialequations} substitutes the discrete neural network hidden layers by a differentiable function. 
+It is a smooth version of residual neural networks. 
+The output of this continuous-depth network is the solution of an initial value point ODE problem ending at an arbitrarily depth. 
+The forward propagation does not store the gradients and intermediate values and is conducted by a black-box ODE solver. 
+The neural ODE based models have constant memory cost and can trade numerical precision with time cost. 
+
+\subsection{Method}
+
+The continuous-depth network is described by an initial value point problem with an invariant network function $f$, as shown below. 
+We suppose the output of latent state $z$ and network function $f$ are all vectors. 
+\begin{equation*}
+    \left\{\begin{aligned}
+        &\frac{dz(t)}{dt} = f(z(t),t,\theta) \\
+        &z(t_0) = z_0
+    \end{aligned}\right.
+\end{equation*}
+
+The output at time $t_1$ is numerically solved by a black-box ODE solver, for example Runge-Kutta method. 
+Analytically, we have the solution given by 
+\begin{equation*}
+    z(t_1) = z(t_0) + \int_{t_0}^{t_1} f(z(t),t,\theta)dt. 
+\end{equation*}
+The corresponding loss of the model at time $t_1$ is 
+\begin{equation*}
+    L(z(t_1)) = L\left(z(t_0) + \int_{t_0}^{t_1} f(z(t),t,\theta)dt\right). 
+\end{equation*}
+The gradient w.r.t the model parameter $\theta$ is calculated by 
+\begin{align*}
+    \frac{\partial L}{\partial \theta} = \left(\frac{\partial z(t_1)}{\partial \theta}\right)^T\frac{\partial L}{\partial z(t_1)} &= \left(\frac{\partial z(t_0)}{\partial \theta}+\frac{\partial}{\partial \theta}\int_{t_0}^{t_1}f(z(t),t,\theta)dt\right)^T\frac{\partial L}{\partial z(t_1)} \\
+                                                                                                                   &= \left(\frac{\partial z(t_0)}{\partial \theta}+\int_{t_0}^{t_1}\frac{\partial f}{\partial \theta}+\frac{\partial f}{\partial z(t)}\frac{\partial z(t)}{\partial \theta}dt\right)^T\frac{\partial L}{\partial z(t_1)}, 
+\end{align*}
+where the gradients $\frac{\partial L}{\partial z(t)}$ and $\frac{\partial f}{\partial z(t)}$ can be calculated by auto-differentiation since $f$ is clearly known.
+However, $\frac{\partial z(t)}{\partial \theta}$ is intractable since the latent dynamic $z(t)$ is unobservable.
+
+To solve this, we introduce the adjoint sensitivity method to get the trajectory of $\frac{\partial L}{\partial z(t)}$ by solving another ODE. 
+This helps removing the problematic gradients in computing $\frac{\partial L}{\partial \theta}$. 
+
+\subsubsection{The adjoint and two equations}
+
+We define the adjoint by $a(t):=\frac{\partial L}{\partial z(t)}$. 
+The adjoint satisfies two equations 
+\begin{align}
+    \frac{da(t)}{dt} &= -\left(\frac{\partial}{\partial z(t)}f(z(t),t,\theta)\right)^Ta(t), \label{eq: sec2_adjoint1} \\
+    \frac{\partial L}{\partial \theta} &= -\int_{t_1}^{t_0}\left(\frac{\partial f}{\partial \theta}\right)^Ta(t)dt,  \label{eq: sec2_adjoint2}
+\end{align}
+where the gradient $\frac{\partial f}{\partial \theta}$ in (\ref{eq: sec2_adjoint2}) is the derivative of $f(z(t),t,\theta)$ w.r.t $\theta$ treating $z$ as constant. 
+The two equations record the process of calculating the prior knowledge for updating the parameter. 
+(\ref{eq: sec2_adjoint2}) depends on the trajectory of $a(t)$ which means we need to simultaneously compute the value of $a(t)$ when calculating the numerical approximation of the integral. 
+Before understanding the full backward propagation process, 
+we give the proofs of the two equations respectively. 
+
+\paragraph{Proof of (\ref{eq: sec2_adjoint1})}
+The proof relies on using the definition of derivative as $t_1$ and $t_0$ are arbitrarily close. 
+We start by computing the derivative of loss about $z(t_0)$. 
+
+Suppose $a(t):=\frac{\partial L}{\partial z(t)}$ is differentiable about $t$. 
+We consider a scalar-valued loss $L$. 
+\begin{align*}
+    \frac{\partial L}{\partial z(t_0)} &= (\frac{\partial z(t_1)}{\partial z(t_0)})^T\frac{\partial L}{\partial z(t_1)} \\
+                                       &= \left(I+\frac{\partial}{\partial z(t_0)}\int_{t_0}^{t_1} f(z(t),t,\theta)dt\right)^T\frac{\partial L}{\partial z(t_1)} \\
+                                       &= \frac{\partial L}{\partial z(t_1)} + \left(\frac{\partial}{\partial z(t_0)}\int_{t_0}^{t_1} f(z(t),t,\theta)dt\right)^T\frac{\partial L}{\partial z(t_1)} \\
+    \frac{\partial L}{\partial z(t_1)}-\frac{\partial L}{\partial z(t_0)} &= -\left(\frac{\partial}{\partial z(t_0)}\int_{t_0}^{t_1} f(z(t),t,\theta)dt\right)^T\frac{\partial L}{\partial z(t_1)} \\
+    \frac{\frac{\partial L}{\partial z(t_1)}-\frac{\partial L}{\partial z(t_0)}}{t_1-t_0} &= -\frac{1}{t_1-t_0}\left(\frac{\partial}{\partial z(t_0)}\int_{t_0}^{t_1} f(z(t),t,\theta)dt\right)^T\frac{\partial L}{\partial z(t_1)} \\
+    \lim_{t_1\rightarrow t_0} \frac{\frac{\partial L}{\partial z(t_1)}-\frac{\partial L}{\partial z(t_0)}}{t_1-t_0} &= -\lim_{t_1\rightarrow t_0}\frac{1}{t_1-t_0}\left(\frac{\partial}{\partial z(t_0)}\int_{t_0}^{t_1} f(z(t),t,\theta)dt\right)^T\frac{\partial L}{\partial z(t_1)} \\
+    \frac{\partial}{\partial t}\frac{\partial L}{\partial z(t)}\bigg|_{t=t_0} &= -\left(\frac{\partial}{\partial z(t_0)}f(z(t_0),t,\theta)\right)^T\frac{\partial L}{\partial z(t_0)} \\
+    \frac{da(t)}{d(t)}\bigg|_{t=t_0} &= -\left(\frac{\partial}{\partial z(t_0)}f(z(t_0),t,\theta)\right)^Ta(t_0).
+\end{align*}
+By the randomness of $t_0$, we have 
+\begin{equation*}
+    \frac{da(t)}{dt} = -\left(\frac{\partial}{\partial z(t)}f(z(t),t,\theta)\right)^Ta(t).
+\end{equation*}
+
+\paragraph{Proof of (\ref{eq: sec2_adjoint2})}
+Aside from the definition of derivative, the proof relies on the trajectory of adjoint given by the Equation \ref{eq: sec2_adjoint1}. 
+We also need the intermediate expression of the gradient $\frac{\partial L}{\partial\theta}$. 
+We suppose the parameter $\theta\in\mathbb{R}^d$.
+
+\begin{align*}
+    \frac{\partial L}{\partial \theta} = \left(\frac{\partial z(t_1)}{\partial \theta}\right)^Ta(t_1) &= \left(\frac{\partial z(t_0)}{\partial \theta}+\frac{\partial}{\partial \theta}\int_{t_0}^{t_1}f(z(t),t,\theta)dt\right)^Ta(t_1) \\
+                                                                                                                   &= \left(\frac{\partial z(t_0)}{\partial \theta}+\int_{t_0}^{t_1}\frac{\partial f}{\partial \theta}+\frac{\partial f}{\partial z(t)}\frac{\partial z(t)}{\partial \theta}dt\right)^Ta(t_1). 
+\end{align*}
+From the above deduction, we have a new equation.
+\begin{align*}
+    \left(\frac{\partial z(t_1)}{\partial \theta}\right)^Ta(t_1) &= \left(\frac{\partial z(t_0)}{\partial \theta}+\int_{t_0}^{t_1}\frac{\partial f}{\partial \theta}+\frac{\partial f}{\partial z(t)}\frac{\partial z(t)}{\partial \theta}dt\right)^Ta(t_1) \\
+    (\frac{\partial z(t_1)}{\partial \theta} - \frac{\partial z(t_0)}{\partial \theta})^Ta(t_1) &= \left(\int_{t_0}^{t_1}\frac{\partial f}{\partial \theta}+\frac{\partial f}{\partial z(t)}\frac{\partial z(t)}{\partial \theta}dt\right)^Ta(t_1) \\
+    \lim_{t_1\rightarrow t_0}\frac{1}{t_1-t_0}(\frac{\partial z(t_1)}{\partial \theta} - \frac{\partial z(t_0)}{\partial \theta})^Ta(t_1) &= \lim_{t_1\rightarrow t_0}\frac{1}{t_1-t_0}\left(\int_{t_0}^{t_1}\frac{\partial f}{\partial \theta}+\frac{\partial f}{\partial z(t)}\frac{\partial z(t)}{\partial \theta}dt\right)^Ta(t_1) \\
+    \left(\frac{\partial}{\partial t}\frac{\partial z(t)}{\partial\theta}\right)^T\bigg|_{t=t_0}a(t_0) &= \left(\frac{\partial f}{\partial \theta}+\frac{\partial f}{\partial z(t)}\frac{\partial z(t)}{\partial \theta}\right)^T\bigg|_{t=t_0}a(t_0).
+\end{align*}
+By the randomness of $t_0$, we have 
+\begin{align*}
+    \left(\frac{\partial}{\partial t}\frac{\partial z(t)}{\partial\theta}\right)^Ta(t) = \left(\frac{\partial f}{\partial \theta}+\frac{\partial f}{\partial z(t)}\frac{\partial z(t)}{\partial \theta}\right)^Ta(t) &= \left(\frac{\partial f}{\partial \theta}\right)^Ta(t)+ \left(\frac{\partial f}{\partial z(t)}\frac{\partial z(t)}{\partial \theta}\right)^Ta(t) \\
+                                                                                       &= \left(\frac{\partial f}{\partial \theta}\right)^Ta(t)+\left(\frac{\partial z(t)}{\partial \theta}\right)^T\left(\frac{\partial f}{\partial z(t)}\right)^Ta(t) \\
+                                                                                       &= \left(\frac{\partial f}{\partial \theta}\right)^Ta(t) - \left(\frac{\partial z(t)}{\partial \theta}\right)^T\frac{da(t)}{dt} & (\text{By (\ref{eq: sec2_adjoint1})}) \\
+    \left(\frac{\partial}{\partial t}\frac{\partial z(t)}{\partial\theta}\right)^Ta(t) + \left(\frac{\partial z(t)}{\partial \theta}\right)^T\frac{da(t)}{dt} &= \left(\frac{\partial f}{\partial \theta}\right)^Ta(t) \\
+    \frac{d}{dt}\left(\left(\frac{\partial z(t)}{\partial\theta}\right)^Ta(t)\right) &= \left(\frac{\partial f}{\partial \theta}\right)^Ta(t) \\
+    \left(\frac{\partial z(t_1)}{\partial\theta}\right)^Ta(t_1) - \left(\frac{\partial z(t_0)}{\partial\theta}\right)^Ta(t_0) &= \int_{t_0}^{t_1}\left(\frac{\partial f}{\partial \theta}\right)^Ta(t)dt \\
+    \left(\frac{\partial z(t_1)}{\partial\theta}\right)^Ta(t_1) &= \int_{t_0}^{t_1}\left(\frac{\partial f}{\partial \theta}\right)^Ta(t)dt. 
+\end{align*}
+The last step is by the fact that the initial layer $z(t_0)$ is irrelevant to the parameter $\theta$.  
+Since the LHS is just the gradient $\frac{\partial L}{\partial \theta}$, 
+we have 
+\begin{equation*}
+    \frac{\partial L}{\partial \theta} = -\int_{t_1}^{t_0}\left(\frac{\partial f}{\partial \theta}\right)^Ta(t)dt. 
+\end{equation*}
+
+\subsubsection{Backward propagation of neural ODE}
+
+To get the gradient $\frac{\partial L}{\partial\theta}$, 
+we compute the integral (\ref{eq: sec2_adjoint2}) and need the simultaneous computation of the adjoint $a(t)$ through (\ref{eq: sec2_adjoint1}). 
+Among the two processes, the gradients $\frac{\partial f}{\partial z(t)}$ and $\frac{\partial f}{\partial\theta}$ are calculated by auto-differentiation 
+and the vector-Hessian products are computed subsequently. 
+The adjoint trajectory ODE (\ref{eq: sec2_adjoint1}) is solved by a random ODE-solver starting from the initial time $t_1$ and initial value $a(t_1)=\frac{\partial L}{\partial z(t_1)}$. 
+At each end of a step, the output $a(t_{intermediate})$ is stored temporarily and accumulated by the integral. 
+This proceeds until $t_0$, making sure the memory cost is a constant. 
