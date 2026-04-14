@@ -1,0 +1,65 @@
+\documentclass{article}
+
+\usepackage[a4paper, left=2cm, right=2cm, top=3cm, bottom=2cm]{geometry}
+\usepackage{amsmath}
+\usepackage{mathptmx}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{dsfont}
+\usepackage{amstext}
+\usepackage{array}
+\usepackage{lmodern}
+\usepackage{arydshln}
+\usepackage{rotating}
+\usepackage{mathtools}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{tikz}
+
+\usetikzlibrary{arrows.meta, positioning, fit}
+
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    citecolor=black,
+    urlcolor=blue,
+    pdfborder={0 0 0}
+}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+
+\usepackage[backend=bibtex]{biblatex}
+\addbibresource{references.bib}
+
+\usepackage{theorem}
+\theoremheaderfont{\normalfont \bfseries}
+\theorembodyfont{\it}
+\newenvironment{proof}{\par\vspace*{1em}\noindent\textbf{Proof:}\par}{\par\hfill $\Box$\par}
+\newtheorem{definition}{\textbf{Definition}}[section]
+\newtheorem{theorem}{\textbf{Theorem}}[section]
+\newtheorem{lemma}{\textbf{Lemma}}[section]
+\newtheorem{example}{\textbf{Example}}[section]
+\newtheorem{assumption}{\textbf{Assumption}}[section]
+\newtheorem{proposition}{\textbf{Proposition}}[section]
+\newtheorem{corollary}{\textbf{Corollary}}[section]
+\newtheorem{remark}{\textbf{Remark}}[section]
+
+\begin{document}
+
+\tableofcontents
+\newpage
+
+\input{VAE.tex}
+
+\input{NeuralODE.tex}
+
+\input{CTLODEGVAE.tex}
+
+\newpage
+
+\printbibliography
+
+\end{document}
